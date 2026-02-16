@@ -1,0 +1,18 @@
+{
+  "name": "treebot-accounts",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Página/API para criar e validar contas do TreeBot (deploy no Railway).",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "pg": "^8.13.1"
+  }
+}
+

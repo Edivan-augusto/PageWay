@@ -1,0 +1,95 @@
+const express = require('express')
+const cors = require('cors')
+const bcrypt = require('bcryptjs')
+const { Pool } = require('pg')
+const path = require('node:path')
+
+const PORT = Number(process.env.PORT || 3000)
+const DATABASE_URL = process.env.DATABASE_URL
+
+if (!DATABASE_URL) {
+  console.error('Missing DATABASE_URL. On Railway, add a Postgres and set DATABASE_URL env.')
+  process.exit(1)
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false },
+})
+
+async function ensureSchema() {
+  await pool.query(`
+    create table if not exists accounts (
+      id bigserial primary key,
+      username text not null unique,
+      password_hash text not null,
+      created_at timestamptz not null default now()
+    );
+  `)
+}
+
+function jsonError(res, status, message) {
+  return res.status(status).json({ ok: false, error: message })
+}
+
+function requireAdminKey(req, res, next) {
+  const required = process.env.ADMIN_KEY
+  if (!required) return next()
+  const got = req.header('x-admin-key')
+  if (!got || got !== required) return jsonError(res, 401, 'Unauthorized')
+  return next()
+}
+
+const app = express()
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'x-admin-key'] }))
+app.use(express.json({ limit: '2mb' }))
+
+app.get('/health', (_req, res) => res.json({ ok: true }))
+
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'))
+})
+app.use('/public', express.static(path.join(__dirname, 'public')))
+
+app.post('/api/create', requireAdminKey, async (req, res) => {
+  const username = String(req.body?.username ?? '').trim().toLowerCase()
+  const password = String(req.body?.password ?? '')
+  if (username.length < 3) return jsonError(res, 400, 'username inválido')
+  if (password.length < 6) return jsonError(res, 400, 'senha deve ter no mínimo 6 caracteres')
+
+  const hash = await bcrypt.hash(password, 10)
+  try {
+    await pool.query('insert into accounts (username, password_hash) values ($1, $2)', [username, hash])
+    return res.json({ ok: true })
+  } catch (e) {
+    if (String(e?.code) === '23505') return jsonError(res, 409, 'username já existe')
+    console.error(e)
+    return jsonError(res, 500, 'erro ao criar conta')
+  }
+})
+
+app.post('/api/login', async (req, res) => {
+  const username = String(req.body?.username ?? '').trim().toLowerCase()
+  const password = String(req.body?.password ?? '')
+  if (!username || !password) return jsonError(res, 400, 'informe username e senha')
+
+  try {
+    const r = await pool.query('select password_hash from accounts where username = $1', [username])
+    if (r.rowCount === 0) return jsonError(res, 401, 'login inválido')
+    const ok = await bcrypt.compare(password, r.rows[0].password_hash)
+    if (!ok) return jsonError(res, 401, 'login inválido')
+    return res.json({ ok: true })
+  } catch (e) {
+    console.error(e)
+    return jsonError(res, 500, 'erro no login')
+  }
+})
+
+ensureSchema()
+  .then(() => {
+    app.listen(PORT, () => console.log(`treebot-accounts listening on :${PORT}`))
+  })
+  .catch((e) => {
+    console.error('Failed to init schema', e)
+    process.exit(1)
+  })

@@ -3,6 +3,7 @@ const cors = require('cors')
 const bcrypt = require('bcryptjs')
 const path = require('node:path')
 const fs = require('node:fs/promises')
+const os = require('node:os')
 
 const PORT = Number(process.env.PORT || 3000)
 const DATABASE_URL = process.env.DATABASE_URL
@@ -33,8 +34,9 @@ function requireAdminKey(req, res, next) {
 function getAccountsFilePath() {
   const p = process.env.ACCOUNTS_FILE
   if (p) return p
-  // Railway normalmente permite escrever no filesystem do container, mas pode ser efêmero em redeploy.
-  return path.join(process.cwd(), 'accounts.json')
+  // Sempre usa um local gravável (em hosts/serverless o cwd pode ser read-only).
+  // Observação: no modo file, os dados podem ser efêmeros após restart/redeploy.
+  return path.join(os.tmpdir(), 'accounts.json')
 }
 
 async function readJsonIfExists(filePath) {
@@ -123,7 +125,7 @@ app.post('/api/create', requireAdminKey, async (req, res) => {
   } catch (e) {
     if (String(e?.code) === '23505') return jsonError(res, 409, 'username ja existe')
     console.error(e)
-    return jsonError(res, 500, 'erro ao criar conta')
+    return jsonError(res, 500, `erro ao criar conta: ${e?.message ?? String(e)}`)
   }
 })
 
@@ -160,4 +162,3 @@ ensureSchema()
     console.error('Failed to init schema', e)
     process.exit(1)
   })
-

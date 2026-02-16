@@ -144,8 +144,20 @@
             },
             body: JSON.stringify({ username, password }),
           })
-          const j = await r.json()
-          if (!j.ok) return setOut('err', j.error || 'Erro')
+          const text = await r.text()
+          let j = null
+          try {
+            j = text ? JSON.parse(text) : null
+          } catch {
+            j = null
+          }
+
+          if (!r.ok) {
+            const msg = j?.error || `HTTP ${r.status}: ${text.slice(0, 180)}`
+            return setOut('err', msg)
+          }
+
+          if (!j?.ok) return setOut('err', j?.error || 'Erro')
           setOut('ok', 'Conta criada com sucesso.')
         } catch (e) {
           setOut('err', String(e))
@@ -154,4 +166,3 @@
     </script>
   </body>
 </html>
-

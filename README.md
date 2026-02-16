@@ -6,12 +6,14 @@ Este diretório contém uma página + API simples para:
 
 ## Deploy no Railway (resumo)
 
-1. Crie um projeto no Railway e adicione um **Postgres**.
+1. Crie um projeto no Railway.
 2. Faça deploy apontando o root para `Create_Accounts/`.
-3. Configure as variáveis:
-   - `DATABASE_URL` (Railway costuma fornecer automaticamente via Postgres)
-   - (Opcional) `PGSSL=false` se seu Postgres não usar SSL (em Railway normalmente pode manter o padrão)
-   - (Opcional) `ADMIN_KEY` (se definido, a criação de conta exige header `x-admin-key`)
+3. (Opcional) Configure variáveis:
+   - `ADMIN_KEY` (se definido, a criação de conta exige header `x-admin-key`)
+   - `ACCOUNTS_FILE` (caminho do arquivo `accounts.json` se quiser customizar)
+
+> Sem Postgres: por padrão o servidor salva em `accounts.json` no filesystem do container. Em Railway isso pode ser
+> **efêmero** (pode resetar em redeploy/restart). Se você quiser persistência real, use Postgres ou outro storage.
 
 ## Usar no app
 

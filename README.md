@@ -17,11 +17,7 @@ Este diretório contém uma página + API simples para:
 
 ## Usar no app
 
-No TreeBot, crie um arquivo `treebot-config.json` ao lado do executável contendo:
-
-```json
-{ "authBaseUrl": "https://SEU-PROJETO.up.railway.app" }
-```
+O TreeBot valida login via `POST /api/login` no servidor que você publicar no Railway.
 
 ## Endpoints
 

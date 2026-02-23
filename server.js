@@ -4,10 +4,12 @@ const bcrypt = require('bcryptjs')
 const path = require('node:path')
 const fs = require('node:fs/promises')
 const os = require('node:os')
+const crypto = require('node:crypto')
 
 const PORT = Number(process.env.PORT || 3000)
 const DATABASE_URL = process.env.DATABASE_URL
 const STORE_MODE = DATABASE_URL ? 'postgres' : 'file'
+const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 120)
 
 let pool = null
 if (STORE_MODE === 'postgres') {
@@ -19,8 +21,9 @@ if (STORE_MODE === 'postgres') {
   })
 }
 
-function jsonError(res, status, message) {
-  return res.status(status).json({ ok: false, error: message })
+function jsonError(res, status, message, extra) {
+  const payload = { ok: false, error: message, ...(extra && typeof extra === 'object' ? extra : null) }
+  return res.status(status).json(payload)
 }
 
 function requireAdminKey(req, res, next) {
@@ -37,6 +40,12 @@ function getAccountsFilePath() {
   // Sempre usa um local gravável (em hosts/serverless o cwd pode ser read-only).
   // Observação: no modo file, os dados podem ser efêmeros após restart/redeploy.
   return path.join(os.tmpdir(), 'accounts.json')
+}
+
+function getSessionsFilePath() {
+  const p = process.env.SESSIONS_FILE
+  if (p) return p
+  return path.join(os.tmpdir(), 'sessions.json')
 }
 
 async function readJsonIfExists(filePath) {
@@ -74,6 +83,84 @@ async function fileGetPasswordHash(username) {
   return row?.password_hash ?? null
 }
 
+function generateSessionToken() {
+  return crypto.randomBytes(32).toString('hex')
+}
+
+function isSessionExpired(lastSeenAtIso) {
+  const t = Date.parse(String(lastSeenAtIso || ''))
+  if (!Number.isFinite(t)) return true
+  return Date.now() - t > SESSION_TTL_SECONDS * 1000
+}
+
+async function fileReadSessions() {
+  const filePath = getSessionsFilePath()
+  const data = (await readJsonIfExists(filePath)) ?? { activeByUser: {}, byToken: {} }
+  if (!data.activeByUser || typeof data.activeByUser !== 'object') data.activeByUser = {}
+  if (!data.byToken || typeof data.byToken !== 'object') data.byToken = {}
+  return { filePath, data }
+}
+
+async function fileWriteSessions(filePath, data) {
+  await writeJsonAtomic(filePath, data)
+}
+
+async function fileGetActiveSession(username) {
+  const { filePath, data } = await fileReadSessions()
+  const token = data.activeByUser[username]
+  if (!token) return { session: null }
+  const s = data.byToken[token]
+  if (!s || s.username !== username || s.revoked_at) {
+    delete data.activeByUser[username]
+    await fileWriteSessions(filePath, data)
+    return { session: null }
+  }
+  if (isSessionExpired(s.last_seen_at)) {
+    s.revoked_at = new Date().toISOString()
+    delete data.activeByUser[username]
+    await fileWriteSessions(filePath, data)
+    return { session: null }
+  }
+  return { session: { token, ...s } }
+}
+
+async function fileRevokeSessionToken(token) {
+  const { filePath, data } = await fileReadSessions()
+  const s = data.byToken[token]
+  if (s && !s.revoked_at) {
+    s.revoked_at = new Date().toISOString()
+    if (data.activeByUser[s.username] === token) delete data.activeByUser[s.username]
+    await fileWriteSessions(filePath, data)
+  }
+  return true
+}
+
+async function fileCreateSession(username, deviceId) {
+  const { filePath, data } = await fileReadSessions()
+  const token = generateSessionToken()
+  const now = new Date().toISOString()
+  data.byToken[token] = { username, device_id: deviceId || null, created_at: now, last_seen_at: now, revoked_at: null }
+  data.activeByUser[username] = token
+  await fileWriteSessions(filePath, data)
+  return { token }
+}
+
+async function filePingSession(token) {
+  const { filePath, data } = await fileReadSessions()
+  const s = data.byToken[token]
+  if (!s || s.revoked_at) return { ok: false, status: 401, error: 'sessao invalida' }
+  if (isSessionExpired(s.last_seen_at)) {
+    s.revoked_at = new Date().toISOString()
+    if (data.activeByUser[s.username] === token) delete data.activeByUser[s.username]
+    await fileWriteSessions(filePath, data)
+    return { ok: false, status: 401, error: 'sessao expirada' }
+  }
+  s.last_seen_at = new Date().toISOString()
+  data.activeByUser[s.username] = token
+  await fileWriteSessions(filePath, data)
+  return { ok: true, username: s.username }
+}
+
 async function ensureSchema() {
   if (STORE_MODE !== 'postgres') return
   await pool.query(`
@@ -84,10 +171,36 @@ async function ensureSchema() {
       created_at timestamptz not null default now()
     );
   `)
+
+  await pool.query(`
+    create table if not exists sessions (
+      token text primary key,
+      username text not null references accounts(username) on delete cascade,
+      device_id text,
+      created_at timestamptz not null default now(),
+      last_seen_at timestamptz not null default now(),
+      revoked_at timestamptz
+    );
+  `)
+
+  await pool.query(`
+    create unique index if not exists sessions_one_active_per_user
+    on sessions(username)
+    where revoked_at is null;
+  `)
+
+  await pool.query(`create index if not exists sessions_username_idx on sessions(username);`)
+  await pool.query(`create index if not exists sessions_last_seen_idx on sessions(last_seen_at);`)
 }
 
 const app = express()
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'x-admin-key'] }))
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-key'],
+  })
+)
 app.use(express.json({ limit: '2mb' }))
 
 app.get('/health', async (_req, res) => {
@@ -147,10 +260,117 @@ app.post('/api/login', async (req, res) => {
 
     const ok = await bcrypt.compare(password, passwordHash)
     if (!ok) return jsonError(res, 401, 'login invalido')
-    return res.json({ ok: true })
+
+    const deviceId = String(req.body?.device_id ?? '').trim().slice(0, 120) || null
+    const force = !!req.body?.force
+
+    if (STORE_MODE === 'postgres') {
+      const active = await pool.query(
+        `
+          select token, device_id, last_seen_at
+          from sessions
+          where username = $1
+            and revoked_at is null
+            and last_seen_at > (now() - ($2::int * interval '1 second'))
+          order by last_seen_at desc
+          limit 1
+        `,
+        [username, SESSION_TTL_SECONDS]
+      )
+
+      if (active.rowCount > 0 && !force) {
+        return jsonError(res, 409, 'conta ja esta em uso em outro acesso', {
+          code: 'SESSION_ACTIVE',
+          active_device_id: active.rows[0].device_id ?? null,
+          last_seen_at: active.rows[0].last_seen_at,
+        })
+      }
+
+      await pool.query('begin')
+      try {
+        await pool.query('update sessions set revoked_at = now() where username = $1 and revoked_at is null', [username])
+        const token = generateSessionToken()
+        await pool.query('insert into sessions (token, username, device_id) values ($1, $2, $3)', [token, username, deviceId])
+        await pool.query('commit')
+        return res.json({ ok: true, token, ttl_seconds: SESSION_TTL_SECONDS })
+      } catch (e) {
+        await pool.query('rollback')
+        if (String(e?.code) === '23505') {
+          return jsonError(res, 409, 'conta ja esta em uso em outro acesso', { code: 'SESSION_ACTIVE' })
+        }
+        throw e
+      }
+    } else {
+      const active = await fileGetActiveSession(username)
+      if (active.session && !force) {
+        return jsonError(res, 409, 'conta ja esta em uso em outro acesso', {
+          code: 'SESSION_ACTIVE',
+          active_device_id: active.session.device_id ?? null,
+          last_seen_at: active.session.last_seen_at,
+        })
+      }
+      if (active.session && force) await fileRevokeSessionToken(active.session.token)
+      const created = await fileCreateSession(username, deviceId)
+      return res.json({ ok: true, token: created.token, ttl_seconds: SESSION_TTL_SECONDS })
+    }
   } catch (e) {
     console.error(e)
     return jsonError(res, 500, 'erro no login')
+  }
+})
+
+function getBearerToken(req) {
+  const raw = String(req.header('authorization') || '').trim()
+  if (!raw) return null
+  const lower = raw.toLowerCase()
+  if (!lower.startsWith('bearer ')) return null
+  const token = raw.slice(7).trim()
+  return token || null
+}
+
+app.post('/api/session/ping', async (req, res) => {
+  const token = getBearerToken(req)
+  if (!token) return jsonError(res, 401, 'missing bearer token')
+
+  try {
+    if (STORE_MODE === 'postgres') {
+      const r = await pool.query(
+        `
+          update sessions
+          set last_seen_at = now()
+          where token = $1
+            and revoked_at is null
+            and last_seen_at > (now() - ($2::int * interval '1 second'))
+          returning username
+        `,
+        [token, SESSION_TTL_SECONDS]
+      )
+      if (r.rowCount === 0) return jsonError(res, 401, 'sessao invalida ou expirada', { code: 'SESSION_INVALID' })
+      return res.json({ ok: true })
+    } else {
+      const r = await filePingSession(token)
+      if (!r.ok) return jsonError(res, r.status, r.error, { code: 'SESSION_INVALID' })
+      return res.json({ ok: true })
+    }
+  } catch (e) {
+    console.error(e)
+    return jsonError(res, 500, 'erro na sessao')
+  }
+})
+
+app.post('/api/session/logout', async (req, res) => {
+  const token = getBearerToken(req)
+  if (!token) return jsonError(res, 401, 'missing bearer token')
+  try {
+    if (STORE_MODE === 'postgres') {
+      await pool.query('update sessions set revoked_at = now() where token = $1 and revoked_at is null', [token])
+    } else {
+      await fileRevokeSessionToken(token)
+    }
+    return res.json({ ok: true })
+  } catch (e) {
+    console.error(e)
+    return jsonError(res, 500, 'erro no logout')
   }
 })
 

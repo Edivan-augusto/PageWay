@@ -23,7 +23,9 @@ O TreeBot valida login via `POST /api/login` no servidor que você publicar no R
 
 - `GET /health` → `{ ok: true }`
 - `POST /api/create` body: `{ username, password }`
-- `POST /api/login` body: `{ username, password }`
+- `POST /api/login` body: `{ username, password, device_id?, force? }` -> `{ ok: true, token, ttl_seconds }`
+- `POST /api/session/ping` header: `Authorization: Bearer <token>` -> `{ ok: true }`
+- `POST /api/session/logout` header: `Authorization: Bearer <token>` -> `{ ok: true }`
 
 ## Notas
 
